@@ -14,3 +14,5 @@ build/
 .DS_Store
 .coverage
 htmlcov/
+task-mesh-design-doc-v1.md
+task-mesh-design-doc-v1.pdf
