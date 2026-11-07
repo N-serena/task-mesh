@@ -5,7 +5,6 @@ from engine.models import TaskMessage
 # Define our topology
 STREAMS = {
     "stream:tasks:pending": "cg_main_workers",
-    "stream:tasks:retry": "cg_main_workers",
     "stream:tasks:dlq": "cg_recovery_agents",
     "stream:tasks:completed": None, # Append-only, no consumer group
     "stream:tasks:dead": None       # Append-only, no consumer group

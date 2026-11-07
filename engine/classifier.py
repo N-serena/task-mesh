@@ -1,5 +1,8 @@
 import asyncio
 from enum import Enum
+
+import httpx
+import redis.exceptions as redis_exc
 from pydantic import ValidationError
 
 class ErrorAction(Enum):
@@ -7,20 +10,33 @@ class ErrorAction(Enum):
     ROUTE_TO_DLQ = "ROUTE_TO_DLQ"
     ROUTE_TO_DEAD = "ROUTE_TO_DEAD"
 
+# The exception types Redis and httpx raise on network trouble. Neither library's
+# errors subclass the builtin ConnectionError or asyncio.TimeoutError.
+TRANSIENT_ERRORS = (
+    asyncio.TimeoutError,
+    ConnectionError,
+    redis_exc.ConnectionError,
+    redis_exc.TimeoutError,
+    httpx.TimeoutException,
+    httpx.NetworkError,
+)
+
+# Payload-level failures the Recovery Agent can attempt to repair.
+# ValidationError subclasses ValueError.
+SCHEMA_ERRORS = (ValidationError, TypeError, KeyError, ValueError)
+
 def classify_error(error: Exception) -> ErrorAction:
     """
     Evaluates an exception and routes the task accordingly.
     """
-    # 1. Schema & Data Errors -> Route to the LLM DLQ for repair
-    # If the payload was missing a key, had the wrong type, or failed a regex
-    if isinstance(error, (ValidationError, TypeError, KeyError, ValueError)):
-        return ErrorAction.ROUTE_TO_DLQ
-    
-    # 2. Transient Infrastructure Errors -> Standard retry
-    # If a database was briefly unavailable or an API request timed out
-    if isinstance(error, (asyncio.TimeoutError, ConnectionError)):
+    # Transient infrastructure errors -> standard retry
+    if isinstance(error, TRANSIENT_ERRORS):
         return ErrorAction.RETRY_LOCAL
-        
-    # 3. Fatal/Unknown Errors -> Poison pill (Drop it)
+
+    # Schema & data errors -> route to the LLM DLQ for repair
+    if isinstance(error, SCHEMA_ERRORS):
+        return ErrorAction.ROUTE_TO_DLQ
+
+    # Fatal/unknown errors -> poison pill (drop it)
     # Examples: AuthenticationError, NotImplementedError, ZeroDivisionError
     return ErrorAction.ROUTE_TO_DEAD

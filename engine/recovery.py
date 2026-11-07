@@ -89,7 +89,7 @@ async def process_dlq_task(redis: Redis, worker_id: str, message_id: str, raw_da
             "retry_count": str(task.retry_count),
             "timestamp": str(task.timestamp)
         }
-        await redis.xadd("stream:tasks:retry", flat_record)
+        await redis.xadd("stream:tasks:pending", flat_record)
         await update_state(redis, task.task_id, TaskStatus.PENDING)
 
     except Exception as e:

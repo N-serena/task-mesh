@@ -9,8 +9,9 @@ def _get_key(task_id: str) -> str:
 async def initialize_state(redis: Redis, task_id: str) -> TaskStateRecord:
     """Creates the initial state tracking record when a task is ingested."""
     state = TaskStateRecord()
-    # Pydantic's model_dump converts Enums and floats to flat dicts for Redis
-    mapping = state.model_dump(mode="json")
+    # Redis cannot encode None, so unset fields are omitted and fall back to
+    # model defaults when the record is read back.
+    mapping = state.model_dump(mode="json", exclude_none=True)
     await redis.hset(_get_key(task_id), mapping=mapping)
     return state
 
