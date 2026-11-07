@@ -12,11 +12,15 @@ from plugins.registry import tool_registry
 # Configure the Gemini API
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-# We use Gemini 1.5 Flash for high-speed, low-latency reasoning
+# Caps the blocking LLM call. A slow model drains the recovery budget and the
+# task reaches a terminal state.
+LLM_TIMEOUT_SECONDS = 30
+
+# A flash-tier model keeps repair latency low.
 # Enforcing 'application/json' guarantees the output is parseable
 generation_config = {"response_mime_type": "application/json"}
 model = genai.GenerativeModel(
-    'gemini-1.5-flash',
+    'gemini-3.8-flash',
     generation_config=generation_config,
     system_instruction=(
         "You are a strict data-reconciliation system. Your only job is to map broken JSON "
@@ -42,7 +46,9 @@ async def repair_payload(dlq_msg: DLQMessage) -> dict:
     """
     
     # In a production system, this would be an async call using the SDK's async client
-    response = model.generate_content(prompt)
+    response = model.generate_content(
+        prompt, request_options={"timeout": LLM_TIMEOUT_SECONDS}
+    )
     return json.loads(response.text)
 
 async def process_dlq_task(redis: Redis, worker_id: str, message_id: str, raw_data: dict):
