@@ -134,6 +134,14 @@ python run_worker.py
 python run_recovery.py
 ```
 
+### Run the tests
+
+The suite stubs Redis and the LLM, so it needs no Docker and no API key:
+
+```bash
+python -m pytest
+```
+
 ### Try it
 
 Run the chaos test, which submits one valid and one malformed payload concurrently, prints
@@ -212,4 +220,6 @@ Known gaps, in rough priority order:
 - `RETRY_LOCAL` classification does not yet re-queue with backoff.
 - `stream:tasks:completed` and `stream:tasks:dead` are declared but not yet written to.
 - Logging is `print()`-based; no structured, task-correlated logs.
-- No automated test suite — verification is currently via `chaos_injector.py`.
+- The test suite stubs Redis and the LLM, so real stream semantics (`XREADGROUP`, the
+  Pending Entries List) and the live LLM call are covered only by running
+  `chaos_injector.py` against a real Redis.
