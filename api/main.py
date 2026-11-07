@@ -1,6 +1,7 @@
 import uuid
 import hashlib
 import json
+from contextlib import asynccontextmanager
 from typing import Dict, Any
 from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
@@ -11,17 +12,22 @@ from engine.queue import publish_task, setup_stream_topology
 from engine.state import initialize_state, get_state
 from engine.models import TaskMessage
 
-app = FastAPI(title="Task Mesh Gateway")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Ensures the Redis streams and consumer groups exist before accepting traffic."""
+    redis = await get_redis()
+    await setup_stream_topology(redis)
+    try:
+        yield
+    finally:
+        # Releases the shared connection pool.
+        await redis.aclose()
+
+app = FastAPI(title="Task Mesh Gateway", lifespan=lifespan)
 
 class JobRequest(BaseModel):
     task_type: str
     payload: Dict[str, Any]
-
-@app.on_event("startup")
-async def startup_event():
-    """Ensure the Redis streams and consumer groups exist before accepting traffic."""
-    redis = await get_redis()
-    await setup_stream_topology(redis)
 
 @app.post("/jobs", response_model=dict)
 async def submit_job(request: JobRequest, redis: Redis = Depends(get_redis)):
