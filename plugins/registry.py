@@ -15,10 +15,14 @@ class ToolRegistry:
 
     def get_schema_definition(self, name: str) -> dict:
         """Exports the JSON Schema definition for the LLM prompt."""
+        return self.get_schema_class(name).model_json_schema()
+
+    def get_schema_class(self, name: str) -> Type[BaseModel]:
+        """Returns the Pydantic contract a tool's payload must satisfy."""
         if name not in self._tools:
             raise ValueError(f"Tool '{name}' not found in registry.")
         _, schema = self._tools[name]
-        return schema.model_json_schema()
+        return schema
 
     async def execute(self, name: str, raw_payload: dict) -> dict:
         """

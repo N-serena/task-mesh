@@ -209,11 +209,19 @@ identifiers. Worth revisiting if the pipeline ever carries sensitive data.
 
 ## Status
 
-Working: ingestion, worker execution, error classification, DLQ routing, LLM repair with a
-deterministic validation gate, and re-injection.
+Verified end-to-end against a real Redis and a live model: a drifted payload
+(`{"company_ticker": "msft", "year": "25"}`) walks
+`IN_PROGRESS -> IN_DLQ -> RECOVERING -> COMPLETED` and executes with the repaired
+arguments, in roughly two seconds.
 
 Known gaps, in rough priority order:
 
+- A transient LLM failure (503/504) consumes a recovery attempt, so two blips exhaust the
+  budget and kill a repairable task. `engine/classifier.py` already distinguishes transient
+  from permanent errors and should be reused here.
+- Streams are never trimmed. `XACK` clears the Pending Entries List but leaves entries in
+  the stream, so `stream:tasks:pending` and `stream:tasks:dlq` grow without bound. No
+  `MAXLEN` or retention policy is set.
 - `XAUTOCLAIM` sweeper is unimplemented — a worker that crashes mid-task strands its
   message in the Pending Entries List.
 - `idempotency_key` is computed and carried but not yet enforced for deduplication.

@@ -245,6 +245,18 @@ class TestErrorClassifier:
         assert classify_error(error) is ErrorAction.ROUTE_TO_DEAD
 
 
+class TestRecoveryModuleImport:
+    def test_import_needs_no_credentials_and_builds_no_client(self, monkeypatch):
+        """The agent module must import in CI, where no API key is present."""
+        import importlib
+
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+        reloaded = importlib.reload(recovery)
+        assert reloaded._client is None, "the client must be built on first use"
+
+
 class TestTopology:
     def test_every_declared_stream_has_a_reader_or_is_append_only(self):
         assert "stream:tasks:retry" not in STREAMS
