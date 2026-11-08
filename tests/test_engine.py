@@ -11,8 +11,9 @@ from pydantic import ValidationError
 import engine.recovery as recovery
 import plugins.financial.tools  # noqa: F401  (registers the financial tools)
 from engine.classifier import ErrorAction, classify_error
-from engine.models import DLQMessage, TaskStatus
-from engine.queue import STREAMS
+import engine.queue as queue
+from engine.models import DLQMessage, TaskMessage, TaskStatus
+from engine.queue import STREAMS, publish_dlq_message, publish_task
 from engine.state import get_state, initialize_state
 from engine.worker import process_task
 from plugins.financial.models import FetchMetricsArgs
@@ -30,6 +31,16 @@ REPAIRED_PAYLOAD = {"ticker": "MSFT", "fiscal_year": 2025}
 @pytest.fixture
 def redis() -> StubRedis:
     return StubRedis()
+
+
+def task_message(task_id: str, payload: dict) -> TaskMessage:
+    return TaskMessage(
+        job_id="job_test",
+        task_id=task_id,
+        task_type="fetch_sec_metrics",
+        idempotency_key="key_test",
+        payload=payload,
+    )
 
 
 def stream_entry(task_id: str, payload: dict) -> dict:
@@ -381,6 +392,66 @@ class TestRecoveryModuleImport:
 
         reloaded = importlib.reload(recovery)
         assert reloaded._client is None, "the client must be built on first use"
+
+
+class TestStreamTrimming:
+    """XACK clears the PEL but leaves the entry, so every publish must cap length."""
+
+    async def test_task_publishes_request_a_length_cap(self, redis):
+        await publish_task(redis, PENDING_STREAM, task_message("task_1", GOOD_PAYLOAD))
+
+        stream, maxlen, approximate = redis.trim_requests[-1]
+        assert stream == PENDING_STREAM
+        assert maxlen == queue.TASK_STREAM_MAXLEN
+        assert approximate is True
+
+    async def test_dlq_publishes_request_a_tighter_cap(self, redis):
+        message = DLQMessage.model_validate_json(
+            dlq_entry("task_1", DRIFTED_PAYLOAD)["payload"]
+        )
+        await publish_dlq_message(redis, message)
+
+        stream, maxlen, approximate = redis.trim_requests[-1]
+        assert stream == DLQ_STREAM
+        assert maxlen == queue.DLQ_STREAM_MAXLEN
+        assert approximate is True
+
+    async def test_dlq_entries_are_capped_lower_than_task_entries(self):
+        """DLQ records carry a stack trace and schema, so they are much larger."""
+        assert queue.DLQ_STREAM_MAXLEN < queue.TASK_STREAM_MAXLEN
+
+    async def test_every_worker_and_recovery_write_is_capped(self, redis, monkeypatch):
+        """Fails if a new code path writes to a stream without going through queue.py."""
+
+        async def repair(dlq_msg):
+            return REPAIRED_PAYLOAD
+
+        monkeypatch.setattr(recovery, "repair_payload", repair)
+        await initialize_state(redis, "task_heal")
+
+        await process_task(redis, "worker_1", "1-0", stream_entry("task_heal", DRIFTED_PAYLOAD))
+        await recovery.process_dlq_task(
+            redis, "recovery_1", "2-0", redis.streams[DLQ_STREAM][0]
+        )
+
+        assert redis.trim_requests, "no stream writes were recorded"
+        uncapped = [(s, m) for s, m, _ in redis.trim_requests if m is None]
+        assert not uncapped, f"these writes bypassed the length cap: {uncapped}"
+
+    async def test_a_failed_repair_requeue_is_also_capped(self, redis, monkeypatch):
+        async def failing(dlq_msg):
+            raise ValueError("wrong shape")
+
+        monkeypatch.setattr(recovery, "repair_payload", failing)
+        await initialize_state(redis, "task_bad")
+
+        await recovery.process_dlq_task(
+            redis, "recovery_1", "1-0", dlq_entry("task_bad", DRIFTED_PAYLOAD)
+        )
+
+        stream, maxlen, _ = redis.trim_requests[-1]
+        assert stream == DLQ_STREAM
+        assert maxlen == queue.DLQ_STREAM_MAXLEN
 
 
 class TestTopology:

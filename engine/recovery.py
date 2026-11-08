@@ -9,6 +9,7 @@ from engine.models import TaskStatus, DLQMessage
 from engine.state import update_state
 from engine.locks import acquire_lock, release_lock
 from engine.classifier import ErrorAction, classify_error
+from engine.queue import publish_dlq_message, publish_task
 from plugins.registry import tool_registry
 
 # Repairs the model produced that failed the validation gate.
@@ -111,19 +112,9 @@ async def process_dlq_task(redis: Redis, worker_id: str, message_id: str, raw_da
         
         print(f"[{worker_id}] Repair successful! Re-injecting task {task.task_id}.")
         
-        # 5. Re-inject to Retry Queue
+        # 5. Re-inject to the stream the workers read
         task.payload = patched_payload
-        
-        flat_record = {
-            "job_id": task.job_id,
-            "task_id": task.task_id,
-            "task_type": task.task_type,
-            "idempotency_key": task.idempotency_key,
-            "payload": json.dumps(task.payload),
-            "retry_count": str(task.retry_count),
-            "timestamp": str(task.timestamp)
-        }
-        await redis.xadd("stream:tasks:pending", flat_record)
+        await publish_task(redis, "stream:tasks:pending", task)
         await update_state(redis, task.task_id, TaskStatus.PENDING)
 
     except Exception as e:
@@ -141,8 +132,8 @@ async def process_dlq_task(redis: Redis, worker_id: str, message_id: str, raw_da
             print(f"[{worker_id}] LLM repair failed on task {task.task_id}: {e} "
                   f"(attempt {dlq_msg.recovery_attempts}/{MAX_RECOVERY_ATTEMPTS}).")
 
-        await redis.xadd("stream:tasks:dlq", {"payload": dlq_msg.model_dump_json()})
-        
+        await publish_dlq_message(redis, dlq_msg)
+
     finally:
         # Acknowledge the DLQ stream so we don't process this specific message again
         await redis.xack("stream:tasks:dlq", "cg_recovery_agents", message_id)

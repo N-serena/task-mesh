@@ -7,6 +7,7 @@ from engine.models import TaskMessage, TaskStatus, DLQMessage
 from engine.state import update_state
 from engine.locks import acquire_lock, release_lock
 from engine.classifier import classify_error, ErrorAction
+from engine.queue import publish_dlq_message
 from plugins.registry import tool_registry
 
 MAX_RETRIES = 3
@@ -57,7 +58,7 @@ async def process_task(redis: Redis, worker_id: str, message_id: str, raw_data: 
                 stack_trace=traceback.format_exc(),
                 target_schema=tool_registry.get_schema_definition(task.task_type)
             )
-            await redis.xadd("stream:tasks:dlq", {"payload": dlq_msg.model_dump_json()})
+            await publish_dlq_message(redis, dlq_msg)
             await update_state(redis, task.task_id, TaskStatus.IN_DLQ)
             
         elif action == ErrorAction.RETRY_LOCAL:

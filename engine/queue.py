@@ -1,14 +1,28 @@
 import json
 from redis.asyncio import Redis
-from engine.models import TaskMessage
+from engine.models import DLQMessage, TaskMessage
+
+DLQ_STREAM = "stream:tasks:dlq"
 
 # Define our topology
 STREAMS = {
     "stream:tasks:pending": "cg_main_workers",
-    "stream:tasks:dlq": "cg_recovery_agents",
+    DLQ_STREAM: "cg_recovery_agents",
     "stream:tasks:completed": None, # Append-only, no consumer group
     "stream:tasks:dead": None       # Append-only, no consumer group
 }
+
+# XACK clears the Pending Entries List but leaves the entry in the stream, so a
+# length cap is the only thing that reclaims it. Every publish passes one, which
+# is why all stream writes go through this module.
+#
+# Redis trims whole macro-nodes rather than exact counts, keeping XADD O(1), so
+# the real length drifts slightly above these numbers.
+TASK_STREAM_MAXLEN = 10_000
+
+# DLQ entries carry a stack trace and a JSON schema, so they are far larger than
+# a task record and get a tighter cap.
+DLQ_STREAM_MAXLEN = 1_000
 
 async def setup_stream_topology(redis: Redis):
     """
@@ -47,5 +61,19 @@ async def publish_task(redis: Redis, stream_name: str, task: TaskMessage) -> str
     }
     
     # xadd appends the record to the stream
-    message_id = await redis.xadd(stream_name, flat_record)
+    message_id = await redis.xadd(
+        stream_name, flat_record, maxlen=TASK_STREAM_MAXLEN, approximate=True
+    )
     return message_id
+
+async def publish_dlq_message(redis: Redis, dlq_msg: DLQMessage) -> str:
+    """
+    Pushes a failed task and its repair context to the DLQ for the Recovery Agent.
+    Returns the unique Redis-generated message ID.
+    """
+    return await redis.xadd(
+        DLQ_STREAM,
+        {"payload": dlq_msg.model_dump_json()},
+        maxlen=DLQ_STREAM_MAXLEN,
+        approximate=True,
+    )

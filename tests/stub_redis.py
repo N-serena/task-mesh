@@ -13,6 +13,7 @@ class StubRedis:
         self.streams: dict[str, list[dict]] = {}
         self.keys: dict[str, str] = {}
         self.acked: list[tuple[str, str]] = []
+        self.trim_requests: list[tuple[str, int | None, bool]] = []
 
     @staticmethod
     def _encodable(value) -> None:
@@ -32,11 +33,19 @@ class StubRedis:
     async def hgetall(self, key: str) -> dict[str, str]:
         return dict(self.hashes.get(key, {}))
 
-    async def xadd(self, stream: str, record: dict) -> str:
+    async def xadd(
+        self,
+        stream: str,
+        record: dict,
+        maxlen: int | None = None,
+        approximate: bool = True,
+    ) -> str:
         for value in record.values():
             self._encodable(value)
         entries = self.streams.setdefault(stream, [])
         entries.append(record)
+        # Recorded so tests can assert a length cap was requested.
+        self.trim_requests.append((stream, maxlen, approximate))
         return f"{len(entries)}-0"
 
     async def xack(self, stream: str, group: str, message_id: str) -> int:

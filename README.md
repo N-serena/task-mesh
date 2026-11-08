@@ -218,11 +218,11 @@ The recovery budget is split: repairs the model actually produced are capped at 
 attempts lost to the model being unreachable get their own budget of 5 with exponential
 backoff. An outage therefore cannot consume a repairable task's remediation attempts.
 
+Streams are length-capped on every publish, so they cannot grow without bound. All stream
+writes go through `engine/queue.py`, which is where the cap lives.
+
 Known gaps, in rough priority order:
 
-- Streams are never trimmed. `XACK` clears the Pending Entries List but leaves entries in
-  the stream, so `stream:tasks:pending` and `stream:tasks:dlq` grow without bound. No
-  `MAXLEN` or retention policy is set.
 - `XAUTOCLAIM` sweeper is unimplemented — a worker that crashes mid-task strands its
   message in the Pending Entries List.
 - `idempotency_key` is computed and carried but not yet enforced for deduplication.
