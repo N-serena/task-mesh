@@ -2,8 +2,10 @@ import asyncio
 import json
 
 import httpx
+import httpx2
 import pytest
 import redis.exceptions as redis_exc
+from google.genai import errors as genai_errors
 from pydantic import ValidationError
 
 import engine.recovery as recovery
@@ -43,7 +45,12 @@ def stream_entry(task_id: str, payload: dict) -> dict:
     }
 
 
-def dlq_entry(task_id: str, payload: dict, recovery_attempts: int = 0) -> dict:
+def dlq_entry(
+    task_id: str,
+    payload: dict,
+    recovery_attempts: int = 0,
+    transient_attempts: int = 0,
+) -> dict:
     message = DLQMessage(
         task={
             "job_id": "job_test",
@@ -57,6 +64,7 @@ def dlq_entry(task_id: str, payload: dict, recovery_attempts: int = 0) -> dict:
         stack_trace="",
         target_schema=tool_registry.get_schema_definition("fetch_sec_metrics"),
         recovery_attempts=recovery_attempts,
+        transient_attempts=transient_attempts,
     )
     return {"payload": message.model_dump_json()}
 
@@ -217,11 +225,21 @@ class TestErrorClassifier:
             httpx.ConnectError("dns failure"),
             asyncio.TimeoutError(),
             ConnectionError("socket dropped"),
+            # google-genai transports over httpx2, a separate package whose
+            # exceptions share names with httpx but not class identity.
+            httpx2.ConnectTimeout("api slow"),
+            httpx2.ReadTimeout("api slow"),
+            httpx2.ConnectError("dns failure"),
         ],
-        ids=lambda e: type(e).__name__,
+        ids=lambda e: f"{type(e).__module__}.{type(e).__name__}",
     )
     def test_transient_errors_retry(self, error):
         assert classify_error(error) is ErrorAction.RETRY_LOCAL
+
+    def test_httpx_and_httpx2_are_distinct_hierarchies(self):
+        """The reason both packages must be listed; a regression guard if they merge."""
+        assert httpx.TimeoutException is not httpx2.TimeoutException
+        assert not issubclass(httpx2.TimeoutException, httpx.TimeoutException)
 
     @pytest.mark.parametrize(
         "error",
@@ -243,6 +261,114 @@ class TestErrorClassifier:
     )
     def test_fatal_errors_are_dropped(self, error):
         assert classify_error(error) is ErrorAction.ROUTE_TO_DEAD
+
+    @pytest.mark.parametrize(
+        ("code", "expected"),
+        [
+            (503, ErrorAction.RETRY_LOCAL),    # model at capacity
+            (504, ErrorAction.RETRY_LOCAL),    # deadline expired
+            (429, ErrorAction.RETRY_LOCAL),    # rate limited
+            (404, ErrorAction.ROUTE_TO_DEAD),  # model retired
+            (400, ErrorAction.ROUTE_TO_DEAD),  # malformed request
+            (403, ErrorAction.ROUTE_TO_DEAD),  # bad credentials
+        ],
+        ids=lambda v: str(v),
+    )
+    def test_provider_errors_route_by_status_code(self, code, expected):
+        cls = genai_errors.ServerError if code >= 500 else genai_errors.ClientError
+        error = cls(code, {"error": {"message": "x"}})
+        assert classify_error(error) is expected
+
+
+class TestTransientFailureBudget:
+    """A model outage must not consume a repairable task's remediation attempts."""
+
+    @pytest.fixture(autouse=True)
+    def no_backoff(self, monkeypatch):
+        monkeypatch.setattr(recovery, "MAX_BACKOFF_SECONDS", 0)
+
+    @staticmethod
+    def fail_with(monkeypatch, error: Exception):
+        async def failing_repair(dlq_msg):
+            raise error
+
+        monkeypatch.setattr(recovery, "repair_payload", failing_repair)
+
+    @staticmethod
+    def requeued(redis) -> DLQMessage:
+        return DLQMessage.model_validate_json(redis.streams[DLQ_STREAM][-1]["payload"])
+
+    async def test_an_unreachable_model_spares_the_recovery_budget(self, redis, monkeypatch):
+        self.fail_with(monkeypatch, genai_errors.ServerError(503, {"error": {"message": "busy"}}))
+        await initialize_state(redis, "task_bad")
+
+        await recovery.process_dlq_task(
+            redis, "recovery_1", "1-0", dlq_entry("task_bad", DRIFTED_PAYLOAD)
+        )
+
+        message = self.requeued(redis)
+        assert message.transient_attempts == 1
+        assert message.recovery_attempts == 0
+
+    async def test_a_bad_repair_spends_the_recovery_budget(self, redis, monkeypatch):
+        self.fail_with(monkeypatch, ValueError("the model returned the wrong shape"))
+        await initialize_state(redis, "task_bad")
+
+        await recovery.process_dlq_task(
+            redis, "recovery_1", "1-0", dlq_entry("task_bad", DRIFTED_PAYLOAD)
+        )
+
+        message = self.requeued(redis)
+        assert message.recovery_attempts == 1
+        assert message.transient_attempts == 0
+
+    async def test_a_task_survives_an_outage_longer_than_the_repair_budget(
+        self, redis, monkeypatch
+    ):
+        """Three 503s would previously have killed the task. The budget is 2."""
+        self.fail_with(monkeypatch, genai_errors.ServerError(503, {"error": {"message": "busy"}}))
+        await initialize_state(redis, "task_bad")
+
+        entry = dlq_entry("task_bad", DRIFTED_PAYLOAD)
+        for _ in range(3):
+            await recovery.process_dlq_task(redis, "recovery_1", "1-0", entry)
+            entry = {"payload": self.requeued(redis).model_dump_json()}
+
+        assert self.requeued(redis).transient_attempts == 3
+        assert (await get_state(redis, "task_bad")).status != TaskStatus.DEAD
+
+    async def test_a_sustained_outage_still_terminates(self, redis):
+        await initialize_state(redis, "task_bad")
+
+        await recovery.process_dlq_task(
+            redis,
+            "recovery_1",
+            "1-0",
+            dlq_entry("task_bad", DRIFTED_PAYLOAD, transient_attempts=5),
+        )
+
+        assert (await get_state(redis, "task_bad")).status == TaskStatus.DEAD
+
+    async def test_repair_still_works_after_a_transient_blip(self, redis, monkeypatch):
+        """A task that blipped keeps its full repair budget and completes."""
+        self.fail_with(monkeypatch, genai_errors.ServerError(503, {"error": {"message": "busy"}}))
+        await initialize_state(redis, "task_bad")
+        await recovery.process_dlq_task(
+            redis, "recovery_1", "1-0", dlq_entry("task_bad", DRIFTED_PAYLOAD)
+        )
+
+        async def working_repair(dlq_msg):
+            return REPAIRED_PAYLOAD
+
+        monkeypatch.setattr(recovery, "repair_payload", working_repair)
+        await recovery.process_dlq_task(
+            redis, "recovery_1", "2-0", {"payload": self.requeued(redis).model_dump_json()}
+        )
+
+        assert len(redis.streams[PENDING_STREAM]) == 1
+        reinjected = redis.streams[PENDING_STREAM][0]
+        await process_task(redis, "worker_1", "3-0", reinjected)
+        assert (await get_state(redis, "task_bad")).status == TaskStatus.COMPLETED
 
 
 class TestRecoveryModuleImport:

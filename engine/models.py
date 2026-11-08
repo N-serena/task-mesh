@@ -34,7 +34,11 @@ class DLQMessage(BaseModel):
     error_message: str
     stack_trace: str
     target_schema: Dict[str, Any]
+    # Repairs the LLM actually produced and that failed validation.
     recovery_attempts: int = 0
+    # Attempts lost to the LLM being unreachable, budgeted separately so an
+    # outage does not consume a repairable task's remediation attempts.
+    transient_attempts: int = 0
     #last_recovered_at: Optional[float] = None
     #last_recovered_by: Optional[str] = None
     

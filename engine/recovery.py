@@ -8,7 +8,16 @@ from redis.asyncio import Redis
 from engine.models import TaskStatus, DLQMessage
 from engine.state import update_state
 from engine.locks import acquire_lock, release_lock
+from engine.classifier import ErrorAction, classify_error
 from plugins.registry import tool_registry
+
+# Repairs the model produced that failed the validation gate.
+MAX_RECOVERY_ATTEMPTS = 2
+
+# Attempts lost to the model being unreachable. Larger, because these cost no
+# remediation progress and a short outage is worth waiting out.
+MAX_TRANSIENT_ATTEMPTS = 5
+MAX_BACKOFF_SECONDS = 16
 
 # Payload repair is a mechanical transform, so a lite model is sufficient and
 # answers in well under a second.
@@ -70,8 +79,15 @@ async def process_dlq_task(redis: Redis, worker_id: str, message_id: str, raw_da
     task = dlq_msg.task
     
     # 1. Budget Check: Prevent infinite healing loops
-    if dlq_msg.recovery_attempts >= 2:
+    if dlq_msg.recovery_attempts >= MAX_RECOVERY_ATTEMPTS:
         print(f"[{worker_id}] Task {task.task_id} exhausted recovery budget. Marking DEAD.")
+        await update_state(redis, task.task_id, TaskStatus.DEAD)
+        await redis.xack("stream:tasks:dlq", "cg_recovery_agents", message_id)
+        return
+
+    if dlq_msg.transient_attempts >= MAX_TRANSIENT_ATTEMPTS:
+        print(f"[{worker_id}] Task {task.task_id}: LLM unreachable after "
+              f"{dlq_msg.transient_attempts} attempts. Marking DEAD.")
         await update_state(redis, task.task_id, TaskStatus.DEAD)
         await redis.xack("stream:tasks:dlq", "cg_recovery_agents", message_id)
         return
@@ -111,9 +127,20 @@ async def process_dlq_task(redis: Redis, worker_id: str, message_id: str, raw_da
         await update_state(redis, task.task_id, TaskStatus.PENDING)
 
     except Exception as e:
-        print(f"[{worker_id}] LLM repair failed on task {task.task_id}: {e}")
-        # Increment attempt and push back to DLQ for one final try, or mark DEAD next loop
-        dlq_msg.recovery_attempts += 1
+        # A model that was unreachable never produced a repair, so it must not spend
+        # the remediation budget. Its own budget bounds a sustained outage.
+        if classify_error(e) == ErrorAction.RETRY_LOCAL:
+            dlq_msg.transient_attempts += 1
+            delay = min(2 ** dlq_msg.transient_attempts, MAX_BACKOFF_SECONDS)
+            print(f"[{worker_id}] LLM unavailable for task {task.task_id}: {e}. "
+                  f"Retrying in {delay}s (transient {dlq_msg.transient_attempts}"
+                  f"/{MAX_TRANSIENT_ATTEMPTS}).")
+            await asyncio.sleep(delay)
+        else:
+            dlq_msg.recovery_attempts += 1
+            print(f"[{worker_id}] LLM repair failed on task {task.task_id}: {e} "
+                  f"(attempt {dlq_msg.recovery_attempts}/{MAX_RECOVERY_ATTEMPTS}).")
+
         await redis.xadd("stream:tasks:dlq", {"payload": dlq_msg.model_dump_json()})
         
     finally:

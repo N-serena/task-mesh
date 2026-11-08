@@ -10,6 +10,8 @@ pydantic>=2.8,<3
 
 # Async HTTP & Environment
 httpx>=0.27,<1
+# Imported directly by engine/classifier.py; google-genai transports over it.
+httpx2>=2.0,<3
 
 # LLM API Client (For the Recovery Agent)
 google-genai>=3.0,<4
