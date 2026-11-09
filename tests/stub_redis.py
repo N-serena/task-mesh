@@ -20,6 +20,8 @@ class StubRedis:
         self.pending: dict[tuple[str, str], dict] = {}
         self.claim_calls: list[tuple[str, str, str, int]] = []
         self.renew_calls: list[tuple[str, str, int]] = []
+        # Sorted sets, as {name: {member: score}}.
+        self.zsets: dict[str, dict[str, float]] = {}
 
     @staticmethod
     def _encodable(value) -> None:
@@ -103,6 +105,15 @@ class StubRedis:
         await asyncio.sleep(0.001)
         return []
 
+    async def zadd(self, name: str, mapping: dict) -> int:
+        members = self.zsets.setdefault(name, {})
+        added = sum(1 for member in mapping if member not in members)
+        members.update(mapping)
+        return added
+
+    async def zcard(self, name: str) -> int:
+        return len(self.zsets.get(name, {}))
+
     def steal_lock(self, resource: str, token: str = "token_of_another_worker") -> None:
         """Simulates a lock expiring and being re-acquired by a different worker."""
         self.keys[f"lock:task:{resource}"] = token
@@ -114,6 +125,18 @@ class StubRedis:
         the Lua itself is unverified here. lock_check.py covers that against a real
         server.
         """
+        if "zrangebyscore" in script:
+            members = self.zsets.setdefault(key, {})
+            now, count = float(args[0]), int(args[1])
+            due = [
+                member
+                for member, score in sorted(members.items(), key=lambda kv: kv[1])
+                if score <= now
+            ][:count]
+            for member in due:
+                del members[member]
+            return due
+
         token = args[0]
 
         if "pexpire" in script:

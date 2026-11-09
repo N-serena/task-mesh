@@ -7,10 +7,19 @@ from engine.models import TaskMessage, TaskStatus, DLQMessage
 from engine.state import update_state
 from engine.locks import LockLost, acquire_lock, release_lock, run_while_locked
 from engine.classifier import classify_error, ErrorAction
-from engine.queue import claim_stale_messages, publish_dlq_message
+from engine.queue import (
+    claim_due_retries,
+    claim_stale_messages,
+    publish_dlq_message,
+    publish_task,
+    schedule_retry,
+)
 from plugins.registry import tool_registry
 
 MAX_RETRIES = 3
+
+# Caps the exponential backoff between retries of a transient failure.
+MAX_RETRY_BACKOFF_SECONDS = 60
 
 # How long a worker holds a task exclusively without checking in. A live worker
 # renews this for as long as the task runs, so the value bounds how long a crashed
@@ -20,6 +29,10 @@ LOCK_TTL_MS = 10_000
 
 # How often a worker checks the Pending Entries List for abandoned tasks.
 SWEEP_INTERVAL_SECONDS = 10
+
+# How often a worker re-queues retries that have come due. Shorter than the PEL
+# sweep because the first backoff is only a couple of seconds.
+RETRY_SWEEP_INTERVAL_SECONDS = 2
 
 async def process_task(redis: Redis, worker_id: str, message_id: str, raw_data: dict):
     """Processes a single task safely."""
@@ -99,8 +112,15 @@ async def process_task(redis: Redis, worker_id: str, message_id: str, raw_data: 
         elif action == ErrorAction.RETRY_LOCAL:
             if task.retry_count < MAX_RETRIES:
                 task.retry_count += 1
-                # Re-queue the task logic would go here
+                delay = min(2 ** task.retry_count, MAX_RETRY_BACKOFF_SECONDS)
+                await schedule_retry(redis, task, delay)
+                await update_state(redis, task.task_id, TaskStatus.PENDING)
+                print(f"[{worker_id}] Task {task.task_id} hit a transient failure. "
+                      f"Retrying in {delay}s "
+                      f"(attempt {task.retry_count}/{MAX_RETRIES}).")
             else:
+                print(f"[{worker_id}] Task {task.task_id} still failing after "
+                      f"{MAX_RETRIES} retries. Marking DEAD.")
                 await update_state(redis, task.task_id, TaskStatus.DEAD)
                 
         elif action == ErrorAction.ROUTE_TO_DEAD:
@@ -124,6 +144,15 @@ async def sweep_stale_tasks(redis: Redis, worker_id: str) -> int:
         await process_task(redis, worker_id, message_id, raw_data)
     return len(claimed)
 
+async def requeue_due_retries(redis: Redis, worker_id: str) -> int:
+    """Re-queues parked tasks whose backoff has elapsed. Returns how many."""
+    due = await claim_due_retries(redis)
+    for task in due:
+        print(f"[{worker_id}] Retry {task.retry_count}/{MAX_RETRIES} for task "
+              f"{task.task_id} is due. Re-queueing.")
+        await publish_task(redis, "stream:tasks:pending", task)
+    return len(due)
+
 async def worker_loop(redis: Redis, worker_id: str):
     """The infinite blocking pull loop."""
     print(f"[{worker_id}] Starting Stream Worker...")
@@ -133,6 +162,7 @@ async def worker_loop(redis: Redis, worker_id: str):
     await setup_stream_topology(redis)
 
     next_sweep = 0.0
+    next_retry_sweep = 0.0
 
     while True:
         try:
@@ -140,6 +170,10 @@ async def worker_loop(redis: Redis, worker_id: str):
             if now >= next_sweep:
                 next_sweep = now + SWEEP_INTERVAL_SECONDS
                 await sweep_stale_tasks(redis, worker_id)
+
+            if now >= next_retry_sweep:
+                next_retry_sweep = now + RETRY_SWEEP_INTERVAL_SECONDS
+                await requeue_due_retries(redis, worker_id)
 
             # Blocking pull: Wait up to 2 seconds for a new task in the stream
             # ">" means "give me messages that haven't been delivered to any other worker yet"

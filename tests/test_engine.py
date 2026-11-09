@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import json
+import time
 
 import httpx
 import httpx2
@@ -15,7 +16,14 @@ from engine.classifier import ErrorAction, classify_error
 import engine.queue as queue
 import engine.worker as worker
 from engine.models import DLQMessage, TaskMessage, TaskStatus
-from engine.queue import STREAMS, publish_dlq_message, publish_task
+from engine.queue import (
+    RETRY_ZSET,
+    STREAMS,
+    claim_due_retries,
+    publish_dlq_message,
+    publish_task,
+    schedule_retry,
+)
 from engine.locks import LockLost, acquire_lock, renew_lock, run_while_locked
 from engine.locks import RENEWALS_PER_TTL
 from engine.worker import LOCK_TTL_MS
@@ -743,6 +751,161 @@ class TestRecoveryLockRenewal:
         assert (DLQ_STREAM, "1-0") not in redis.acked
         assert DLQ_STREAM not in redis.streams, "no re-queue: the holder still has it"
         assert PENDING_STREAM not in redis.streams, "an abandoned repair re-injects nothing"
+
+
+class TestTransientTaskRetry:
+    """RETRY_LOCAL used to discard the task: ACKed, never re-queued, stuck IN_PROGRESS."""
+
+    TRANSIENT = redis_exc.ConnectionError("redis blipped mid-tool")
+
+    @pytest.fixture(autouse=True)
+    def flaky_tool(self, monkeypatch):
+        """Every execution raises a transient error unless a test replaces this."""
+        async def always_transient(task_type, payload):
+            raise TestTransientTaskRetry.TRANSIENT
+
+        monkeypatch.setattr(tool_registry, "execute", always_transient)
+
+    @staticmethod
+    def entry(task_id: str, retry_count: int = 0) -> dict:
+        record = stream_entry(task_id, GOOD_PAYLOAD)
+        record["retry_count"] = str(retry_count)
+        return record
+
+    @staticmethod
+    def parked(redis) -> list[TaskMessage]:
+        return [
+            TaskMessage.model_validate_json(member)
+            for member in redis.zsets.get(RETRY_ZSET, {})
+        ]
+
+    async def test_the_classifier_still_calls_this_transient(self):
+        """The fix is pointless if the error routes elsewhere."""
+        assert classify_error(self.TRANSIENT) == ErrorAction.RETRY_LOCAL
+
+    async def test_a_transient_failure_parks_the_task_rather_than_dropping_it(self, redis):
+        await initialize_state(redis, "task_blip")
+
+        await process_task(redis, "worker_1", "1-0", self.entry("task_blip"))
+
+        assert len(self.parked(redis)) == 1, "the task must survive a transient failure"
+        assert (await get_state(redis, "task_blip")).status == TaskStatus.PENDING
+
+    async def test_the_message_is_acknowledged_once_the_task_is_parked(self, redis):
+        """The retry copy lives in the sorted set, so the stream entry is finished."""
+        await initialize_state(redis, "task_blip")
+
+        await process_task(redis, "worker_1", "1-0", self.entry("task_blip"))
+
+        assert (PENDING_STREAM, "1-0") in redis.acked
+
+    async def test_a_parked_task_carries_an_incremented_retry_count(self, redis):
+        await initialize_state(redis, "task_blip")
+
+        await process_task(redis, "worker_1", "1-0", self.entry("task_blip", retry_count=1))
+
+        assert self.parked(redis)[0].retry_count == 2
+
+    @pytest.mark.parametrize(
+        ("retry_count", "expected_delay"), [(0, 2), (1, 4), (2, 8)]
+    )
+    async def test_the_backoff_grows_with_each_attempt(
+        self, redis, retry_count, expected_delay
+    ):
+        await initialize_state(redis, "task_blip")
+
+        await process_task(
+            redis, "worker_1", "1-0", self.entry("task_blip", retry_count=retry_count)
+        )
+
+        ready_at = next(iter(redis.zsets[RETRY_ZSET].values()))
+        assert ready_at - time.time() == pytest.approx(expected_delay, abs=1.0)
+
+    async def test_the_backoff_is_capped(self, redis, monkeypatch):
+        monkeypatch.setattr(worker, "MAX_RETRIES", 40)
+        monkeypatch.setattr(worker, "MAX_RETRY_BACKOFF_SECONDS", 60)
+        await initialize_state(redis, "task_blip")
+
+        await process_task(redis, "worker_1", "1-0", self.entry("task_blip", retry_count=30))
+
+        ready_at = next(iter(redis.zsets[RETRY_ZSET].values()))
+        assert ready_at - time.time() == pytest.approx(60, abs=1.0)
+
+    async def test_an_exhausted_retry_budget_marks_the_task_dead(self, redis):
+        await initialize_state(redis, "task_blip")
+
+        await process_task(
+            redis, "worker_1", "1-0", self.entry("task_blip", retry_count=worker.MAX_RETRIES)
+        )
+
+        assert (await get_state(redis, "task_blip")).status == TaskStatus.DEAD
+        assert not self.parked(redis), "a dead task must not also be parked"
+
+    async def test_a_parked_task_is_not_requeued_before_it_is_due(self, redis):
+        await schedule_retry(redis, task_message("task_blip", GOOD_PAYLOAD), 30)
+
+        assert await worker.requeue_due_retries(redis, "worker_1") == 0
+        assert len(self.parked(redis)) == 1, "it must stay parked until due"
+
+    async def test_a_due_task_is_requeued_to_the_pending_stream(self, redis):
+        await schedule_retry(redis, task_message("task_blip", GOOD_PAYLOAD), delay_seconds=0)
+
+        assert await worker.requeue_due_retries(redis, "worker_1") == 1
+        assert len(redis.streams[PENDING_STREAM]) == 1
+        assert not self.parked(redis), "a re-queued task must leave the sorted set"
+
+    async def test_a_claimed_retry_is_not_handed_out_twice(self, redis):
+        """Two workers sweeping at once must not both re-queue the same task."""
+        await schedule_retry(redis, task_message("task_blip", GOOD_PAYLOAD), delay_seconds=0)
+
+        first = await claim_due_retries(redis)
+        second = await claim_due_retries(redis)
+
+        assert len(first) == 1
+        assert second == []
+
+    async def test_an_unreadable_parked_retry_is_dropped(self, redis):
+        redis.zsets[RETRY_ZSET] = {"{not a task}": 0.0}
+
+        assert await claim_due_retries(redis) == []
+        assert not redis.zsets[RETRY_ZSET], "it must not be retried forever"
+
+    async def test_the_worker_loop_actually_requeues_due_retries(self, redis):
+        """Guards the wiring, not just requeue_due_retries in isolation."""
+        await schedule_retry(redis, task_message("task_blip", GOOD_PAYLOAD), delay_seconds=0)
+
+        loop_task = asyncio.create_task(worker.worker_loop(redis, "worker_1"))
+        await asyncio.sleep(0.05)
+        loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop_task
+
+        assert not self.parked(redis), "worker_loop must sweep due retries"
+
+    async def test_a_task_that_blips_once_then_succeeds_completes(self, redis, monkeypatch):
+        """The whole point: a transient failure costs a delay, not the task."""
+        attempts = []
+
+        async def fails_once(task_type, payload):
+            attempts.append(payload)
+            if len(attempts) == 1:
+                raise TestTransientTaskRetry.TRANSIENT
+            return {"ok": True}
+
+        monkeypatch.setattr(tool_registry, "execute", fails_once)
+        await initialize_state(redis, "task_blip")
+
+        await process_task(redis, "worker_1", "1-0", self.entry("task_blip"))
+        assert (await get_state(redis, "task_blip")).status == TaskStatus.PENDING
+
+        # Fast-forward past the backoff.
+        redis.zsets[RETRY_ZSET] = {m: 0.0 for m in redis.zsets[RETRY_ZSET]}
+        assert await worker.requeue_due_retries(redis, "worker_1") == 1
+
+        await process_task(redis, "worker_1", "2-0", redis.streams[PENDING_STREAM][-1])
+
+        assert len(attempts) == 2
+        assert (await get_state(redis, "task_blip")).status == TaskStatus.COMPLETED
 
 
 class TestTopology:

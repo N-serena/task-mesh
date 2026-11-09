@@ -48,6 +48,10 @@ machine, and **Lua** for distributed locking.
 | `stream:tasks:completed` | *(none)* | Reporting / UI | Append-only audit log of successes |
 | `stream:tasks:dead` | *(none)* | Alerting | Append-only log of fatal failures |
 
+Transient failures are held in a sorted set, `zset:tasks:retry`, scored by the time each
+task comes due. Streams deliver as soon as an entry is added, so a delayed retry needs a
+structure consumers poll by due time. Workers check it every 2 seconds.
+
 ### Components
 
 | Component | Responsibility |
@@ -162,6 +166,10 @@ their own live check:
 python lock_check.py
 ```
 
+```bash
+python retry_check.py
+```
+
 To submit a job by hand, the API is also browsable at `http://localhost:8000/docs`.
 
 ---
@@ -175,6 +183,7 @@ task-mesh/
 ├── docker-compose.yml      # Redis
 ├── chaos_injector.py       # End-to-end test: happy + malformed payloads
 ├── lock_check.py           # Live check: the Lua lock scripts and renewal
+├── retry_check.py          # Live check: the Lua retry scheduling
 │
 ├── api/
 │   └── main.py             # POST /jobs, GET /jobs/{task_id}
@@ -247,6 +256,12 @@ holder that loses its lock anyway has its work cancelled and leaves the message
 pending for the new holder. This matters most in the recovery agent, where a model
 call is allowed 30s against a 15s lock.
 
+A tool that fails transiently no longer loses its task. The task is parked in
+`zset:tasks:retry` with an exponential backoff (2s, 4s, 8s, capped at 60s) and re-queued by
+whichever worker sweeps next, so a worker that dies while tasks are parked strands none of
+them. After `MAX_RETRIES` it is marked `DEAD`. Claiming due tasks is a single Lua script,
+because two workers sweeping at the same moment would otherwise both re-queue the same task.
+
 Known gaps, in rough priority order:
 
 - A worker whose event loop stalls past its TTL still loses its lock, and the heartbeat
@@ -254,9 +269,10 @@ Known gaps, in rough priority order:
   but a task stalled mid-side-effect has already done part of its work;
   `idempotency_key` enforcement is what would make that safe.
 - `idempotency_key` is computed and carried but not yet enforced for deduplication.
-- `RETRY_LOCAL` classification does not yet re-queue with backoff.
 - `stream:tasks:completed` and `stream:tasks:dead` are declared but not yet written to.
 - Logging is `print()`-based; no structured, task-correlated logs.
 - The test suite stubs Redis and the LLM, so real stream semantics (`XREADGROUP`, the
   Pending Entries List) and the live LLM call are covered only by running
-  `chaos_injector.py` and `lock_check.py` against a real Redis.
+  `chaos_injector.py`, `lock_check.py` and `retry_check.py` against a real Redis.
+- The two live checks duplicate some setup. If more accumulate they are worth folding
+  into one suite that skips itself when Redis is unreachable.

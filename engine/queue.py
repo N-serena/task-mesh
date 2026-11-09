@@ -1,8 +1,14 @@
 import json
+import time
 from redis.asyncio import Redis
 from engine.models import DLQMessage, TaskMessage
 
 DLQ_STREAM = "stream:tasks:dlq"
+
+# Tasks waiting out a transient failure, scored by the time they come due. Redis
+# Streams deliver as soon as an entry is added, so a delayed retry needs a sorted
+# set that consumers poll by due time.
+RETRY_ZSET = "zset:tasks:retry"
 
 # Define our topology
 STREAMS = {
@@ -72,6 +78,42 @@ async def claim_stale_messages(
     )
     # returns (cursor, messages, deleted) tuple.
     return result[1]
+
+# Pops the due members in one step. Two workers sweeping at the same moment
+# would otherwise both read a task before either removed it, and re-queue it twice.
+DUE_RETRIES_LUA_SCRIPT = """
+local due = redis.call("zrangebyscore", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, ARGV[2])
+if #due > 0 then
+    redis.call("zrem", KEYS[1], unpack(due))
+end
+return due
+"""
+
+async def schedule_retry(redis: Redis, task: TaskMessage, delay_seconds: float) -> float:
+    """Parks a task until its backoff elapses. Returns the time it comes due.
+
+    The task is held in Redis, so a worker that dies while tasks are parked
+    strands none of them: whichever worker sweeps next re-queues them.
+    """
+    ready_at = time.time() + delay_seconds
+    await redis.zadd(RETRY_ZSET, {task.model_dump_json(): ready_at})
+    return ready_at
+
+async def claim_due_retries(redis: Redis, count: int = 10) -> list[TaskMessage]:
+    """Removes and returns the parked tasks whose backoff has elapsed."""
+    members = await redis.eval(
+        DUE_RETRIES_LUA_SCRIPT, 1, RETRY_ZSET, time.time(), count
+    )
+
+    tasks = []
+    for member in members:
+        # A member that cannot be read is already out of the sorted set, so it is
+        # reported and dropped here.
+        try:
+            tasks.append(TaskMessage.model_validate_json(member))
+        except Exception as e:
+            print(f"Discarding unreadable parked retry: {type(e).__name__}: {e}")
+    return tasks
 
 async def publish_task(redis: Redis, stream_name: str, task: TaskMessage) -> str:
     """
