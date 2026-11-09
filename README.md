@@ -66,7 +66,8 @@ machine, and **Lua** for distributed locking.
 
 1. Client submits a job; the API writes initial state to a Redis Hash and publishes to
    `stream:tasks:pending`.
-2. A worker claims it via `XREADGROUP` and acquires a distributed lock (10s TTL).
+2. A worker claims it via `XREADGROUP` and acquires a distributed lock (10s TTL),
+   renewing it every few seconds for as long as the task runs.
 3. The payload is validated against the tool's Pydantic schema, then executed.
 4. The worker marks the task `COMPLETED`, `XACK`s, and releases the lock.
 
@@ -154,6 +155,13 @@ python chaos_injector.py
 Expected: the happy path reaches `COMPLETED` directly; the chaos path walks
 `IN_DLQ → RECOVERING → PENDING → COMPLETED` after the agent repairs it.
 
+The locking rules depend on Lua that the stubbed suite cannot execute, so they have
+their own live check:
+
+```bash
+python lock_check.py
+```
+
 To submit a job by hand, the API is also browsable at `http://localhost:8000/docs`.
 
 ---
@@ -166,6 +174,7 @@ The execution engine is completely agnostic to the financial domain logic.
 task-mesh/
 ├── docker-compose.yml      # Redis
 ├── chaos_injector.py       # End-to-end test: happy + malformed payloads
+├── lock_check.py           # Live check: the Lua lock scripts and renewal
 │
 ├── api/
 │   └── main.py             # POST /jobs, GET /jobs/{task_id}
@@ -197,6 +206,13 @@ Adding a domain means adding a `plugins/<domain>/` package. The engine never imp
 state, and Lua gives us atomic lock release. One dependency instead of three keeps the
 infrastructure footprint small for an MVP.
 
+**Why the lock, not the PEL, prevents double execution.** `XAUTOCLAIM` reassigns a
+message on an idle timer, which cannot distinguish a dead worker from a slow one. The
+claimant therefore has to ask for the lock, and a live worker keeps its lock by
+renewing it. A long task does get its message reassigned every 15s while it runs, but
+each claimant backs off, and the original worker's `XACK` clears the entry when it
+finishes.
+
 **Why Pydantic field descriptions are written for an LLM.** The `Field(description=...)`
 text in `plugins/financial/models.py` is exported via `model_json_schema()` and fed
 directly to the recovery agent's prompt. Those descriptions are prompt engineering.
@@ -221,14 +237,26 @@ backoff. An outage therefore cannot consume a repairable task's remediation atte
 Streams are length-capped on every publish, so they cannot grow without bound. All stream
 writes go through `engine/queue.py`, which is where the cap lives.
 
+Workers and recovery agents sweep their consumer group's Pending Entries List every 10
+seconds, claiming anything idle for more than 15 seconds. A consumer that dies between
+`XREADGROUP` and `XACK` therefore has its work picked up by a live one.
+
+Both hold their lock open with a heartbeat for as long as the work takes, so the lock
+TTL bounds how long a crashed holder blocks a task and not how long a task may run. A
+holder that loses its lock anyway has its work cancelled and leaves the message
+pending for the new holder. This matters most in the recovery agent, where a model
+call is allowed 30s against a 15s lock.
+
 Known gaps, in rough priority order:
 
-- `XAUTOCLAIM` sweeper is unimplemented — a worker that crashes mid-task strands its
-  message in the Pending Entries List.
+- A worker whose event loop stalls past its TTL still loses its lock, and the heartbeat
+  cannot renew what it cannot reach. Cancellation keeps that from double-executing,
+  but a task stalled mid-side-effect has already done part of its work;
+  `idempotency_key` enforcement is what would make that safe.
 - `idempotency_key` is computed and carried but not yet enforced for deduplication.
 - `RETRY_LOCAL` classification does not yet re-queue with backoff.
 - `stream:tasks:completed` and `stream:tasks:dead` are declared but not yet written to.
 - Logging is `print()`-based; no structured, task-correlated logs.
 - The test suite stubs Redis and the LLM, so real stream semantics (`XREADGROUP`, the
   Pending Entries List) and the live LLM call are covered only by running
-  `chaos_injector.py` against a real Redis.
+  `chaos_injector.py` and `lock_check.py` against a real Redis.

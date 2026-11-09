@@ -7,9 +7,9 @@ from redis.asyncio import Redis
 
 from engine.models import TaskStatus, DLQMessage
 from engine.state import update_state
-from engine.locks import acquire_lock, release_lock
+from engine.locks import LockLost, acquire_lock, release_lock, run_while_locked
 from engine.classifier import ErrorAction, classify_error
-from engine.queue import publish_dlq_message, publish_task
+from engine.queue import DLQ_STREAM, claim_stale_messages, publish_dlq_message, publish_task
 from plugins.registry import tool_registry
 
 # Repairs the model produced that failed the validation gate.
@@ -19,6 +19,13 @@ MAX_RECOVERY_ATTEMPTS = 2
 # remediation progress and a short outage is worth waiting out.
 MAX_TRANSIENT_ATTEMPTS = 5
 MAX_BACKOFF_SECONDS = 16
+
+# How often an agent checks the Pending Entries List for abandoned DLQ messages.
+SWEEP_INTERVAL_SECONDS = 10
+
+# How long an agent holds a DLQ message without checking in. A live agent renews
+# this across the whole repair, which can outlast the TTL on a slow model call.
+DLQ_LOCK_TTL_MS = 15_000
 
 # Payload repair is a mechanical transform, so a lite model is sufficient and
 # answers in well under a second.
@@ -94,16 +101,25 @@ async def process_dlq_task(redis: Redis, worker_id: str, message_id: str, raw_da
         return
 
     # 2. Acquire Distributed Lock
-    lock_token = await acquire_lock(redis, f"dlq_{task.task_id}", ttl_ms=15000)
+    lock_key = f"dlq_{task.task_id}"
+    lock_token = await acquire_lock(redis, lock_key, ttl_ms=DLQ_LOCK_TTL_MS)
     if not lock_token:
         return
+
+    # Set to False where the message must stay in the Pending Entries List.
+    acknowledge = True
 
     try:
         await update_state(redis, task.task_id, TaskStatus.RECOVERING, worker_id)
         print(f"[{worker_id}] Attempting LLM repair for task {task.task_id} (Attempt {dlq_msg.recovery_attempts + 1})")
         
         # 3. Autonomous Repair
-        patched_payload = await repair_payload(dlq_msg)
+        # LLM_TIMEOUT_MS allows a call longer than DLQ_LOCK_TTL_MS, so the heartbeat
+        # keeps the lock alive and a second agent cannot start the same repair.
+        patched_payload = await run_while_locked(
+            redis, lock_key, lock_token, repair_payload(dlq_msg),
+            ttl_ms=DLQ_LOCK_TTL_MS,
+        )
         
         # 4. Deterministic Validation Gate
         # We grab the raw Pydantic class from the registry and force it to validate the LLM's guess
@@ -116,6 +132,13 @@ async def process_dlq_task(redis: Redis, worker_id: str, message_id: str, raw_da
         task.payload = patched_payload
         await publish_task(redis, "stream:tasks:pending", task)
         await update_state(redis, task.task_id, TaskStatus.PENDING)
+
+    except LockLost:
+        # Another agent may already be repairing this message. Spend none of its
+        # budget and leave it pending for whoever holds the lock now.
+        print(f"[{worker_id}] Lost the DLQ lock on task {task.task_id} mid-repair. "
+              f"Abandoning it to the current holder.")
+        acknowledge = False
 
     except Exception as e:
         # A model that was unreachable never produced a repair, so it must not spend
@@ -136,15 +159,34 @@ async def process_dlq_task(redis: Redis, worker_id: str, message_id: str, raw_da
 
     finally:
         # Acknowledge the DLQ stream so we don't process this specific message again
-        await redis.xack("stream:tasks:dlq", "cg_recovery_agents", message_id)
-        await release_lock(redis, f"dlq_{task.task_id}", lock_token)
+        if acknowledge:
+            await redis.xack("stream:tasks:dlq", "cg_recovery_agents", message_id)
+        # Compare-and-delete, so this is a no-op once the lock has changed hands.
+        await release_lock(redis, lock_key, lock_token)
+
+async def sweep_stale_dlq_messages(redis: Redis, worker_id: str) -> int:
+    """Picks up DLQ messages abandoned by crashed agents. Returns how many were claimed."""
+    claimed = await claim_stale_messages(
+        redis, DLQ_STREAM, "cg_recovery_agents", worker_id
+    )
+    for message_id, raw_data in claimed:
+        print(f"[{worker_id}] Reclaimed abandoned DLQ message {message_id} from the PEL.")
+        await process_dlq_task(redis, worker_id, message_id, raw_data)
+    return len(claimed)
 
 async def recovery_loop(redis: Redis, worker_id: str):
     """The infinite blocking pull loop for the DLQ."""
     print(f"[{worker_id}] Starting Recovery Agent...")
-    
+
+    next_sweep = 0.0
+
     while True:
         try:
+            now = asyncio.get_running_loop().time()
+            if now >= next_sweep:
+                next_sweep = now + SWEEP_INTERVAL_SECONDS
+                await sweep_stale_dlq_messages(redis, worker_id)
+
             streams = await redis.xreadgroup(
                 groupname="cg_recovery_agents",
                 consumername=worker_id,

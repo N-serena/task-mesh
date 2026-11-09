@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 
 import httpx
@@ -12,8 +13,12 @@ import engine.recovery as recovery
 import plugins.financial.tools  # noqa: F401  (registers the financial tools)
 from engine.classifier import ErrorAction, classify_error
 import engine.queue as queue
+import engine.worker as worker
 from engine.models import DLQMessage, TaskMessage, TaskStatus
 from engine.queue import STREAMS, publish_dlq_message, publish_task
+from engine.locks import LockLost, acquire_lock, renew_lock, run_while_locked
+from engine.locks import RENEWALS_PER_TTL
+from engine.worker import LOCK_TTL_MS
 from engine.state import get_state, initialize_state
 from engine.worker import process_task
 from plugins.financial.models import FetchMetricsArgs
@@ -452,6 +457,292 @@ class TestStreamTrimming:
         stream, maxlen, _ = redis.trim_requests[-1]
         assert stream == DLQ_STREAM
         assert maxlen == queue.DLQ_STREAM_MAXLEN
+
+
+class TestStaleMessageSweeper:
+    """A consumer that dies before XACK leaves its message in the PEL forever."""
+
+    async def test_an_abandoned_task_is_reclaimed_and_completed(self, redis):
+        await initialize_state(redis, "task_orphan")
+        redis.strand(PENDING_STREAM, "9-0", stream_entry("task_orphan", GOOD_PAYLOAD))
+
+        claimed = await worker.sweep_stale_tasks(redis, "worker_rescuer")
+
+        assert claimed == 1
+        assert (await get_state(redis, "task_orphan")).status == TaskStatus.COMPLETED
+
+    async def test_a_reclaimed_task_is_acknowledged(self, redis):
+        await initialize_state(redis, "task_orphan")
+        redis.strand(PENDING_STREAM, "9-0", stream_entry("task_orphan", GOOD_PAYLOAD))
+
+        await worker.sweep_stale_tasks(redis, "worker_rescuer")
+
+        assert (PENDING_STREAM, "9-0") in redis.acked
+        assert not redis.pending, "the PEL must be empty once the task is handled"
+
+    async def test_nothing_to_reclaim_is_a_no_op(self, redis):
+        assert await worker.sweep_stale_tasks(redis, "worker_rescuer") == 0
+
+    async def test_the_claim_threshold_exceeds_the_task_lock_ttl(self, redis):
+        """A slow-but-alive worker must still hold its lock when a claim happens."""
+        await worker.sweep_stale_tasks(redis, "worker_rescuer")
+
+        _, _, _, min_idle = redis.claim_calls[-1]
+        assert min_idle == queue.STALE_MESSAGE_MS
+        assert min_idle > LOCK_TTL_MS
+
+    async def test_a_reclaimed_task_held_by_a_live_worker_stays_pending(self, redis):
+        """The claimant backs off and leaves the message for the next sweep."""
+        await initialize_state(redis, "task_orphan")
+        redis.strand(PENDING_STREAM, "9-0", stream_entry("task_orphan", GOOD_PAYLOAD))
+        redis.keys["lock:task:task_orphan"] = "held-by-the-original-worker"
+
+        await worker.sweep_stale_tasks(redis, "worker_rescuer")
+
+        assert (await get_state(redis, "task_orphan")).status == TaskStatus.PENDING
+        assert (PENDING_STREAM, "9-0") not in redis.acked
+
+    async def test_the_worker_loop_actually_sweeps(self, redis):
+        """Guards the wiring, not just sweep_stale_tasks in isolation."""
+        loop_task = asyncio.create_task(worker.worker_loop(redis, "worker_1"))
+        await asyncio.sleep(0.05)
+        loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop_task
+
+        assert redis.claim_calls, "worker_loop must sweep the PEL"
+
+    async def test_the_recovery_loop_actually_sweeps(self, redis):
+        loop_task = asyncio.create_task(recovery.recovery_loop(redis, "recovery_1"))
+        await asyncio.sleep(0.05)
+        loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop_task
+
+        assert redis.claim_calls, "recovery_loop must sweep the PEL"
+
+    async def test_an_abandoned_dlq_message_is_reclaimed(self, redis, monkeypatch):
+        async def repair(dlq_msg):
+            return REPAIRED_PAYLOAD
+
+        monkeypatch.setattr(recovery, "repair_payload", repair)
+        await initialize_state(redis, "task_orphan")
+        redis.strand(DLQ_STREAM, "9-0", dlq_entry("task_orphan", DRIFTED_PAYLOAD))
+
+        claimed = await recovery.sweep_stale_dlq_messages(redis, "recovery_rescuer")
+
+        assert claimed == 1
+        assert len(redis.streams[PENDING_STREAM]) == 1
+
+
+class TestUnreadableStreamEntries:
+    """Without this, the sweeper would reclaim a malformed entry forever."""
+
+    @pytest.mark.parametrize(
+        ("entry", "label"),
+        [
+            ({"job_id": "j"}, "missing fields"),
+            (
+                {
+                    "job_id": "j", "task_id": "t", "task_type": "fetch_sec_metrics",
+                    "idempotency_key": "k", "payload": "not json",
+                    "retry_count": "0", "timestamp": "0",
+                },
+                "payload is not json",
+            ),
+        ],
+        ids=["missing-fields", "bad-json"],
+    )
+    async def test_an_unreadable_entry_is_acknowledged_not_retried(
+        self, redis, entry, label
+    ):
+        await process_task(redis, "worker_1", "9-0", entry)
+
+        assert (PENDING_STREAM, "9-0") in redis.acked, label
+
+    async def test_an_unreadable_entry_does_not_survive_a_sweep(self, redis):
+        redis.strand(PENDING_STREAM, "9-0", {"job_id": "incomplete"})
+
+        await worker.sweep_stale_tasks(redis, "worker_rescuer")
+
+        assert not redis.pending, "a malformed entry must not be reclaimed forever"
+
+
+class TestLockRenewal:
+    """A task slower than its lock TTL must not be handed to a second worker."""
+
+    # Short enough that a test can outlive a TTL; the heartbeat fires every third.
+    TTL_MS = 90
+
+    async def slow_work(self, seconds: float = 0.25) -> str:
+        await asyncio.sleep(seconds)
+        return "finished"
+
+    async def test_work_outlasting_the_ttl_still_finishes(self, redis):
+        token = await acquire_lock(redis, "task_slow", ttl_ms=self.TTL_MS)
+
+        result = await run_while_locked(
+            redis, "task_slow", token, self.slow_work(), ttl_ms=self.TTL_MS
+        )
+
+        assert result == "finished"
+        assert len(redis.renew_calls) >= 2, "the heartbeat must renew more than once"
+        assert all(
+            key == "lock:task:task_slow" and renewed == token and ttl == self.TTL_MS
+            for key, renewed, ttl in redis.renew_calls
+        )
+
+    async def test_renewal_extends_only_the_holders_own_lock(self, redis):
+        token = await acquire_lock(redis, "task_a", ttl_ms=self.TTL_MS)
+        assert await renew_lock(redis, "task_a", token, self.TTL_MS) is True
+
+        redis.steal_lock("task_a")
+        assert await renew_lock(redis, "task_a", token, self.TTL_MS) is False
+
+        assert await renew_lock(redis, "task_never_locked", token, self.TTL_MS) is False
+
+    async def test_losing_the_lock_cancels_the_work(self, redis):
+        token = await acquire_lock(redis, "task_slow", ttl_ms=self.TTL_MS)
+        reached_the_end = False
+
+        async def work():
+            nonlocal reached_the_end
+            await asyncio.sleep(0.25)
+            reached_the_end = True
+
+        redis.steal_lock("task_slow")
+
+        with pytest.raises(LockLost):
+            await run_while_locked(
+                redis, "task_slow", token, work(), ttl_ms=self.TTL_MS
+            )
+
+        assert not reached_the_end, "work must stop once another worker holds the lock"
+
+    async def test_an_error_in_the_work_is_not_masked_by_the_heartbeat(self, redis):
+        token = await acquire_lock(redis, "task_slow", ttl_ms=self.TTL_MS)
+
+        async def work():
+            raise ValueError("the payload drifted")
+
+        with pytest.raises(ValueError, match="drifted"):
+            await run_while_locked(
+                redis, "task_slow", token, work(), ttl_ms=self.TTL_MS
+            )
+
+    def test_the_heartbeat_fires_more_than_once_per_ttl(self):
+        """One lost round trip to Redis must not cost the lock."""
+        assert RENEWALS_PER_TTL > 1
+
+
+class TestWorkerLockRenewal:
+    TTL_MS = 90
+
+    @pytest.fixture(autouse=True)
+    def short_ttl(self, monkeypatch):
+        monkeypatch.setattr(worker, "LOCK_TTL_MS", self.TTL_MS)
+
+    @staticmethod
+    def executing(monkeypatch, body):
+        monkeypatch.setattr(tool_registry, "execute", body)
+
+    async def test_a_slow_task_renews_its_lock_while_running(self, redis, monkeypatch):
+        async def slow_tool(task_type, payload):
+            await asyncio.sleep(0.25)
+            return {"ok": True}
+
+        self.executing(monkeypatch, slow_tool)
+        await initialize_state(redis, "task_slow")
+
+        await process_task(redis, "worker_1", "1-0", stream_entry("task_slow", GOOD_PAYLOAD))
+
+        assert redis.renew_calls, "a task outliving its TTL must renew its lock"
+        assert (await get_state(redis, "task_slow")).status == TaskStatus.COMPLETED
+
+    async def test_a_stolen_lock_leaves_the_message_for_its_new_holder(
+        self, redis, monkeypatch
+    ):
+        async def tool_that_loses_the_lock(task_type, payload):
+            redis.steal_lock("task_slow")
+            await asyncio.sleep(0.25)
+            return {"ok": True}
+
+        self.executing(monkeypatch, tool_that_loses_the_lock)
+        await initialize_state(redis, "task_slow")
+
+        await process_task(redis, "worker_1", "1-0", stream_entry("task_slow", GOOD_PAYLOAD))
+
+        assert (PENDING_STREAM, "1-0") not in redis.acked, (
+            "the new holder is responsible for acknowledging the message"
+        )
+        state = await get_state(redis, "task_slow")
+        assert state.status not in (TaskStatus.DEAD, TaskStatus.COMPLETED), (
+            f"a lost lock must not settle the task; it is {state.status.value}"
+        )
+        assert redis.keys["lock:task:task_slow"] == "token_of_another_worker", (
+            "the new holder's lock must survive the old holder's release"
+        )
+
+    async def test_a_lost_lock_does_not_reach_the_dlq(self, redis, monkeypatch):
+        """LockLost would otherwise classify as fatal and kill a running task."""
+        async def tool_that_loses_the_lock(task_type, payload):
+            redis.steal_lock("task_slow")
+            await asyncio.sleep(0.25)
+            return {"ok": True}
+
+        self.executing(monkeypatch, tool_that_loses_the_lock)
+        await initialize_state(redis, "task_slow")
+
+        await process_task(redis, "worker_1", "1-0", stream_entry("task_slow", GOOD_PAYLOAD))
+
+        assert DLQ_STREAM not in redis.streams
+
+
+class TestRecoveryLockRenewal:
+    """LLM_TIMEOUT_MS allows a repair longer than the DLQ lock TTL."""
+
+    TTL_MS = 90
+
+    @pytest.fixture(autouse=True)
+    def short_ttl(self, monkeypatch):
+        monkeypatch.setattr(recovery, "DLQ_LOCK_TTL_MS", self.TTL_MS)
+        monkeypatch.setattr(recovery, "MAX_BACKOFF_SECONDS", 0)
+
+    def test_the_llm_timeout_can_outlast_the_lock_ttl(self):
+        """The reason the heartbeat is needed here, stated as a check."""
+        assert recovery.LLM_TIMEOUT_MS > recovery.DLQ_LOCK_TTL_MS
+
+    async def test_a_slow_repair_renews_its_lock(self, redis, monkeypatch):
+        async def slow_repair(dlq_msg):
+            await asyncio.sleep(0.25)
+            return REPAIRED_PAYLOAD
+
+        monkeypatch.setattr(recovery, "repair_payload", slow_repair)
+        await initialize_state(redis, "task_bad")
+
+        await recovery.process_dlq_task(
+            redis, "recovery_1", "1-0", dlq_entry("task_bad", DRIFTED_PAYLOAD)
+        )
+
+        assert redis.renew_calls, "a slow repair must renew its DLQ lock"
+        assert len(redis.streams[PENDING_STREAM]) == 1
+
+    async def test_a_stolen_dlq_lock_spends_no_budget(self, redis, monkeypatch):
+        async def repair_that_loses_the_lock(dlq_msg):
+            redis.steal_lock("dlq_task_bad")
+            await asyncio.sleep(0.25)
+            return REPAIRED_PAYLOAD
+
+        monkeypatch.setattr(recovery, "repair_payload", repair_that_loses_the_lock)
+        await initialize_state(redis, "task_bad")
+
+        await recovery.process_dlq_task(
+            redis, "recovery_1", "1-0", dlq_entry("task_bad", DRIFTED_PAYLOAD)
+        )
+
+        assert (DLQ_STREAM, "1-0") not in redis.acked
+        assert DLQ_STREAM not in redis.streams, "no re-queue: the holder still has it"
+        assert PENDING_STREAM not in redis.streams, "an abandoned repair re-injects nothing"
 
 
 class TestTopology:
