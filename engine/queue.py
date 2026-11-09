@@ -43,6 +43,36 @@ async def setup_stream_topology(redis: Redis):
                 else:
                     raise e
 
+# A consumer that dies between XREADGROUP and XACK leaves its message in the
+# group's Pending Entries List, where nothing else will ever pick it up. Anything
+# idle longer than this is handed to a live consumer.
+#
+# This exceeds the 10s task lock TTL, so a slow-but-alive worker still holds its
+# lock when the message is claimed and the claimant backs off.
+STALE_MESSAGE_MS = 15_000
+
+async def claim_stale_messages(
+    redis: Redis,
+    stream_name: str,
+    group_name: str,
+    consumer_name: str,
+    min_idle_ms: int = STALE_MESSAGE_MS,
+    count: int = 10,
+) -> list:
+    """
+    Reassigns messages abandoned by dead consumers to this one.
+    Returns the claimed (message_id, fields) pairs.
+    """
+    result = await redis.xautoclaim(
+        stream_name,
+        group_name,
+        consumer_name,
+        min_idle_time=min_idle_ms,
+        count=count,
+    )
+    # returns (cursor, messages, deleted) tuple.
+    return result[1]
+
 async def publish_task(redis: Redis, stream_name: str, task: TaskMessage) -> str:
     """
     Serializes a TaskMessage and pushes it to a Redis Stream.
